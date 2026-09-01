@@ -1,0 +1,10 @@
+.DS_Store
+.deps/
+__pycache__/
+*.py[cod]
+tmp/
+
+# Keep only the best validated submission in version control.
+output/CTOC14_Result_TeamID_fleet*.txt
+output/route_checkpoint.json
+
