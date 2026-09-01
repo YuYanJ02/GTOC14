@@ -6,5 +6,6 @@ tmp/
 
 # Keep only the best validated submission in version control.
 output/CTOC14_Result_TeamID_fleet*.txt
+output/candidate_*.txt
 output/route_checkpoint.json
 

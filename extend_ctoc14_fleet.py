@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,24 @@ from solve_ctoc14 import (
     optimize_candidate,
 )
 from validate_ctoc14 import check, parse
+
+
+def _optimize_task(payload):
+    """Process-pool entry point for one independent endpoint optimization."""
+    state, current_time, candidate, asteroids, max_nfev = payload
+    try:
+        return optimize_candidate(
+            state,
+            current_time,
+            candidate,
+            asteroids,
+            max_nfev=max_nfev,
+        )
+    except (RuntimeError, ValueError, FloatingPointError):
+        # Some trial controls can drive an optimizer through a near-Sun
+        # singularity.  That invalidates only this endpoint candidate, not the
+        # rest of the spacecraft search (or its process pool).
+        return None
 
 
 def load_rows(path: Path) -> list[EventRow]:
@@ -41,6 +60,8 @@ def build_spacecraft(
     *,
     initial_mass: float,
     max_new_targets: int,
+    stop_reserve_kg: float = 5.0,
+    workers: int = 1,
 ) -> tuple[list[EventRow], set[int]]:
     asteroids = load_asteroids()
     state, current_time, prefix = ballistic_prefix(initial_mass)
@@ -53,76 +74,91 @@ def build_spacecraft(
         new_targets.add(174)
     legs = []
 
-    while len(new_targets) < max_new_targets and state[6] > MDRY_KG + 0.1:
-        candidates = candidate_list(
-            state,
-            current_time,
-            asteroids,
-            visited_for_search,
-            keep=18,
-        )
+    if workers < 1:
+        raise ValueError("workers must be positive")
+    executor = ProcessPoolExecutor(max_workers=workers) if workers > 1 else None
+
+    def evaluate_candidates(candidates, *, long_search: bool = False):
         feasible = []
-        print(
-            f"SC {sc_id} leg {len(legs)+1}: day={current_time:.3f} "
-            f"mass={state[6]:.3f} new={len(new_targets)}",
-            flush=True,
-        )
-        for index, candidate in enumerate(candidates, 1):
-            optimized = optimize_candidate(state, current_time, candidate, asteroids)
-            status = "fail" if optimized is None else (
-                f"ok fuel={optimized.fuel_kg:.2f}kg miss={optimized.flyby_km:.4f}km"
-            )
-            print(
-                f"  {index:02d} id={candidate.asteroid_id:3d} "
-                f"day={candidate.encounter_time:8.3f} {status}",
-                flush=True,
-            )
-            if optimized is not None:
-                feasible.append(optimized)
-            if len(feasible) >= 4:
-                break
-        if not feasible:
-            print("  retrying with 900-day candidate horizon", flush=True)
-            candidates = candidate_list(
-                state,
-                current_time,
-                asteroids,
-                visited_for_search,
-                minimum_days=260.0,
-                maximum_days=900.0,
-                step_days=40.0,
-                keep=36,
-            )
-            for index, candidate in enumerate(candidates, 1):
-                optimized = optimize_candidate(
-                    state, current_time, candidate, asteroids, max_nfev=70
-                )
+        max_nfev = 70 if long_search else 55
+        prefix = "L" if long_search else " "
+        batch_size = workers if executor is not None else 1
+        for batch_start in range(0, len(candidates), batch_size):
+            batch = candidates[batch_start : batch_start + batch_size]
+            payloads = [
+                (state, current_time, candidate, asteroids, max_nfev)
+                for candidate in batch
+            ]
+            if executor is None:
+                results = [_optimize_task(payloads[0])]
+            else:
+                results = list(executor.map(_optimize_task, payloads))
+            for offset, (candidate, optimized) in enumerate(zip(batch, results), 1):
+                index = batch_start + offset
                 status = "fail" if optimized is None else (
-                    f"ok fuel={optimized.fuel_kg:.2f}kg miss={optimized.flyby_km:.4f}km"
+                    f"ok fuel={optimized.fuel_kg:.2f}kg "
+                    f"miss={optimized.flyby_km:.4f}km"
                 )
+                distance = "" if long_search else f" d0={candidate.distance_au:.4f}AU"
                 print(
-                    f"  L{index:02d} id={candidate.asteroid_id:3d} "
-                    f"day={candidate.encounter_time:8.3f} {status}",
+                    f"  {prefix}{index:02d} id={candidate.asteroid_id:3d} "
+                    f"day={candidate.encounter_time:8.3f}{distance} {status}",
                     flush=True,
                 )
                 if optimized is not None:
                     feasible.append(optimized)
                 if len(feasible) >= 4:
-                    break
-        if not feasible:
-            break
-        chosen = min(feasible, key=lambda item: item.objective)
-        legs.append(chosen)
-        target_id = chosen.leg.asteroid_id
-        new_targets.add(target_id)
-        visited_for_search.add(target_id)
-        state = chosen.leg.state_separator
-        current_time = chosen.leg.separator_time
-        print(
-            f"CHOSEN SC={sc_id} id={target_id} new={len(new_targets)} "
-            f"day={current_time:.3f} mass={state[6]:.3f}",
-            flush=True,
-        )
+                    return feasible
+        return feasible
+
+    try:
+        while (
+            len(new_targets) < max_new_targets
+            and state[6] > MDRY_KG + stop_reserve_kg
+        ):
+            candidates = candidate_list(
+                state,
+                current_time,
+                asteroids,
+                visited_for_search,
+                keep=18,
+            )
+            print(
+                f"SC {sc_id} leg {len(legs)+1}: day={current_time:.3f} "
+                f"mass={state[6]:.3f} new={len(new_targets)}",
+                flush=True,
+            )
+            feasible = evaluate_candidates(candidates)
+            if not feasible:
+                print("  retrying with 900-day candidate horizon", flush=True)
+                candidates = candidate_list(
+                    state,
+                    current_time,
+                    asteroids,
+                    visited_for_search,
+                    minimum_days=260.0,
+                    maximum_days=900.0,
+                    step_days=40.0,
+                    keep=36,
+                )
+                feasible = evaluate_candidates(candidates, long_search=True)
+            if not feasible:
+                break
+            chosen = min(feasible, key=lambda item: item.objective)
+            legs.append(chosen)
+            target_id = chosen.leg.asteroid_id
+            new_targets.add(target_id)
+            visited_for_search.add(target_id)
+            state = chosen.leg.state_separator
+            current_time = chosen.leg.separator_time
+            print(
+                f"CHOSEN SC={sc_id} id={target_id} new={len(new_targets)} "
+                f"day={current_time:.3f} mass={state[6]:.3f}",
+                flush=True,
+            )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     rows = prefix[:2]
     if legs:
@@ -145,6 +181,8 @@ def main() -> None:
     parser.add_argument("output", type=Path)
     parser.add_argument("--initial-mass", type=float, default=2000.0)
     parser.add_argument("--max-new-targets", type=int, default=17)
+    parser.add_argument("--stop-reserve-kg", type=float, default=5.0)
+    parser.add_argument("--workers", type=int, default=1)
     args = parser.parse_args()
 
     before = check(args.base)
@@ -158,6 +196,8 @@ def main() -> None:
         excluded,
         initial_mass=args.initial_mass,
         max_new_targets=args.max_new_targets,
+        stop_reserve_kg=args.stop_reserve_kg,
+        workers=args.workers,
     )
     rows.extend(new_rows)
     args.output.parent.mkdir(parents=True, exist_ok=True)
