@@ -20,11 +20,12 @@ if DEPS.exists():
     sys.path.insert(0, str(DEPS))
 
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
 
 from ctoc14_core import (
     AU_KM,
     DAY_S,
+    MDOT,
     MDRY_KG,
     MISSION_DAYS,
     EventRow,
@@ -65,6 +66,147 @@ class OptimizedLeg:
     flyby_km: float
     fuel_kg: float
     objective: float
+
+
+def _linear_thrust_fuel_kg(
+    force_start: np.ndarray,
+    force_end: np.ndarray,
+    duration_days: float,
+) -> float:
+    """Integrate the propellant used by one linearly interpolated thrust arc.
+
+    A fixed Gauss-Legendre rule keeps this objective cheap and smooth enough
+    for the constrained fuel-refinement step.  Final acceptance still uses a
+    high-accuracy dynamics propagation, so this quadrature is only an
+    optimization aid.
+    """
+    # A high-order rule remains inexpensive for a two-vector control profile
+    # and stays accurate when the interpolated force passes close to zero,
+    # where the Euclidean norm has a sharp change in derivative.
+    nodes, weights = np.polynomial.legendre.leggauss(64)
+    fractions = 0.5 * (nodes + 1.0)
+    forces = (
+        (1.0 - fractions[:, None]) * force_start[None, :]
+        + fractions[:, None] * force_end[None, :]
+    )
+    mean_force = 0.5 * float(weights @ np.linalg.norm(forces, axis=1))
+    return duration_days * MDOT * mean_force
+
+
+def refine_candidate_fuel(
+    state: np.ndarray,
+    start_time: float,
+    candidate: Candidate,
+    asteroids: dict[int, np.ndarray],
+    seed: OptimizedLeg,
+    *,
+    maxiter: int = 45,
+) -> OptimizedLeg:
+    """Minimize propellant while retaining the candidate encounter position.
+
+    Position matching supplies three equality constraints for six thrust
+    parameters.  The original shooting solve leaves those three remaining
+    degrees of freedom largely unused; SLSQP exploits them to reduce the
+    integral thrust without changing the target or encounter epoch.
+    """
+    target = asteroid_state(asteroids, candidate.asteroid_id, candidate.encounter_time)
+    thrust_days = candidate.encounter_time - start_time - 0.1 - 1.0 / DAY_S
+    cache_raw: np.ndarray | None = None
+    cache_leg: LegResult | None = None
+
+    def unpack(raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return (
+            bounded_vector(raw[:3], CONTROL_LIMIT),
+            bounded_vector(raw[3:], CONTROL_LIMIT),
+        )
+
+    def evaluate(raw: np.ndarray, *, rtol: float = 3e-10) -> LegResult:
+        nonlocal cache_raw, cache_leg
+        if (
+            cache_raw is None
+            or cache_leg is None
+            or not np.array_equal(raw, cache_raw)
+        ):
+            f0, f1 = unpack(raw)
+            cache_leg = propagate_leg(
+                state,
+                start_time,
+                candidate.asteroid_id,
+                candidate.encounter_time,
+                f0,
+                f1,
+                rtol=rtol,
+            )
+            cache_raw = np.array(raw, copy=True)
+        return cache_leg
+
+    def position_constraint(raw: np.ndarray) -> np.ndarray:
+        leg = evaluate(raw)
+        # Thousands of kilometres gives SLSQP derivatives a useful scale.
+        return (leg.state_encounter[:3] - target[:3]) * AU_KM / 1000.0
+
+    def fuel_objective(raw: np.ndarray) -> float:
+        f0, f1 = unpack(raw)
+        return _linear_thrust_fuel_kg(f0, f1, thrust_days) / 1000.0
+
+    result = minimize(
+        fuel_objective,
+        np.array(seed.raw_controls, copy=True),
+        method="SLSQP",
+        constraints={"type": "eq", "fun": position_constraint},
+        options={"maxiter": maxiter, "ftol": 2e-10, "disp": False},
+    )
+
+    # SLSQP can stop after a useful fuel step with a small residual.  Restore
+    # the exact encounter using the same high-accuracy shooting formulation;
+    # starting from the refined point normally requires only a few evaluations.
+    corrected = least_squares(
+        lambda raw: (
+            propagate_leg(
+                state,
+                start_time,
+                candidate.asteroid_id,
+                candidate.encounter_time,
+                *unpack(raw),
+                rtol=2e-12,
+            ).state_encounter[:3]
+            - target[:3]
+        )
+        * AU_KM
+        / 1000.0,
+        result.x,
+        method="trf",
+        max_nfev=30,
+        xtol=2e-12,
+        ftol=2e-12,
+        gtol=2e-12,
+    )
+    f0, f1 = unpack(corrected.x)
+    leg = propagate_leg(
+        state,
+        start_time,
+        candidate.asteroid_id,
+        candidate.encounter_time,
+        f0,
+        f1,
+        rtol=8e-13,
+    )
+    flyby_km = float(np.linalg.norm(leg.state_encounter[:3] - target[:3]) * AU_KM)
+    fuel_kg = float(state[6] - leg.state_separator[6])
+    if (
+        flyby_km > 0.25
+        or leg.state_separator[6] < MDRY_KG + 0.1
+        or fuel_kg > seed.fuel_kg + 1e-7
+    ):
+        return seed
+    duration = candidate.encounter_time - start_time
+    return OptimizedLeg(
+        leg,
+        corrected.x,
+        flyby_km,
+        fuel_kg,
+        fuel_kg + 0.025 * duration,
+    )
 
 
 def make_launch_state(initial_mass: float) -> np.ndarray:

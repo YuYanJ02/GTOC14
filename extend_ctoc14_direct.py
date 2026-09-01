@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, minimize
 
 from ctoc14_core import (
     AU_KM,
@@ -36,6 +36,7 @@ from extend_ctoc14_fleet import _optimize_task, load_rows
 from solve_ctoc14 import (
     CONTROL_LIMIT,
     Candidate,
+    _linear_thrust_fuel_kg,
     append_leg_rows,
     candidate_list,
     initial_controls,
@@ -158,6 +159,132 @@ def optimize_launch_candidate(
         flyby_km,
         fuel_kg,
         objective,
+        float(np.linalg.norm(velocity_kms)),
+    )
+
+
+def refine_launch_candidate_fuel(
+    launch_time_days: float,
+    initial_mass: float,
+    candidate: Candidate,
+    asteroids: dict[int, np.ndarray],
+    seed: OptimizedLaunchLeg,
+    *,
+    maxiter: int = 60,
+) -> OptimizedLaunchLeg:
+    """Use launch-energy freedom to reduce first-leg propellant consumption."""
+    base_state = np.r_[earth_state(launch_time_days), initial_mass]
+    target = asteroid_state(
+        asteroids, candidate.asteroid_id, candidate.encounter_time
+    )
+    thrust_days = candidate.encounter_time - launch_time_days - 0.1 - 1.0 / DAY_S
+    seed_vinf = (
+        seed.launch_state[3:6] - base_state[3:6]
+    ) * AU_KM / DAY_S
+    raw0 = np.r_[
+        inverse_bounded_vector(seed_vinf, VINF_LIMIT_KMS),
+        inverse_bounded_vector(seed.leg.force_start, CONTROL_LIMIT),
+        inverse_bounded_vector(seed.leg.force_end, CONTROL_LIMIT),
+    ]
+    cache_raw: np.ndarray | None = None
+    cache_leg = None
+    cache_launch = None
+
+    def unpack(raw: np.ndarray):
+        velocity_kms = bounded_vector(raw[:3], VINF_LIMIT_KMS)
+        launch_state = np.array(base_state, copy=True)
+        launch_state[3:6] += velocity_kms * DAY_S / AU_KM
+        force_start = bounded_vector(raw[3:6], CONTROL_LIMIT)
+        force_end = bounded_vector(raw[6:9], CONTROL_LIMIT)
+        return launch_state, velocity_kms, force_start, force_end
+
+    def evaluate(raw: np.ndarray):
+        nonlocal cache_raw, cache_leg, cache_launch
+        if (
+            cache_raw is None
+            or cache_leg is None
+            or not np.array_equal(raw, cache_raw)
+        ):
+            launch_state, _velocity, force_start, force_end = unpack(raw)
+            cache_leg = propagate_leg(
+                launch_state,
+                launch_time_days,
+                candidate.asteroid_id,
+                candidate.encounter_time,
+                force_start,
+                force_end,
+                rtol=3e-10,
+            )
+            cache_launch = launch_state
+            cache_raw = np.array(raw, copy=True)
+        return cache_leg, cache_launch
+
+    def position_constraint(raw: np.ndarray) -> np.ndarray:
+        leg, _launch_state = evaluate(raw)
+        return (leg.state_encounter[:3] - target[:3]) * AU_KM / 1000.0
+
+    def fuel_objective(raw: np.ndarray) -> float:
+        _launch_state, _velocity, force_start, force_end = unpack(raw)
+        return _linear_thrust_fuel_kg(
+            force_start, force_end, thrust_days
+        ) / 1000.0
+
+    result = minimize(
+        fuel_objective,
+        raw0,
+        method="SLSQP",
+        constraints={"type": "eq", "fun": position_constraint},
+        options={"maxiter": maxiter, "ftol": 2e-10, "disp": False},
+    )
+    corrected = least_squares(
+        lambda raw: (
+            propagate_leg(
+                unpack(raw)[0],
+                launch_time_days,
+                candidate.asteroid_id,
+                candidate.encounter_time,
+                unpack(raw)[2],
+                unpack(raw)[3],
+                rtol=2e-12,
+            ).state_encounter[:3]
+            - target[:3]
+        )
+        * AU_KM
+        / 1000.0,
+        result.x,
+        method="trf",
+        max_nfev=40,
+        xtol=2e-12,
+        ftol=2e-12,
+        gtol=2e-12,
+    )
+    launch_state, velocity_kms, force_start, force_end = unpack(corrected.x)
+    leg = propagate_leg(
+        launch_state,
+        launch_time_days,
+        candidate.asteroid_id,
+        candidate.encounter_time,
+        force_start,
+        force_end,
+        rtol=8e-13,
+    )
+    flyby_km = float(
+        np.linalg.norm(leg.state_encounter[:3] - target[:3]) * AU_KM
+    )
+    fuel_kg = float(initial_mass - leg.state_separator[6])
+    if (
+        flyby_km > 0.25
+        or leg.state_separator[6] < MDRY_KG + 0.1
+        or fuel_kg > seed.fuel_kg + 1e-7
+    ):
+        return seed
+    duration = candidate.encounter_time - launch_time_days
+    return OptimizedLaunchLeg(
+        leg,
+        launch_state,
+        flyby_km,
+        fuel_kg,
+        fuel_kg + 0.025 * duration,
         float(np.linalg.norm(velocity_kms)),
     )
 
